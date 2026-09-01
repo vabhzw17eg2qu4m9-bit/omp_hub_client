@@ -130,7 +130,7 @@ jobs:
           || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')))
     permissions:
       id-token: write # OIDC — npm verifies the GitHub identity, no secrets
-      contents: read
+      contents: write # tag path also backfills the GitHub Release page
     steps:
       # The released tag (chained path) or the pushed tag (manual path);
       # package.json at that ref carries the matching version by construction.
@@ -153,6 +153,19 @@ jobs:
             echo "Tag v$tag does not match package.json version $version"
             exit 1
           fi
+
+      # Manual tag pushes skip the release job (its if is main/schedule
+      # only), so nothing creates the Release page for them — backfill it
+      # here. The chained path already has one from scripts/auto_release.sh.
+      - name: Ensure GitHub Release exists for the tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release view "$tag" -R vabhzw17eg2qu4m9-bit/omp_hub_client ||
+            gh release create "$tag" -R vabhzw17eg2qu4m9-bit/omp_hub_client \
+              --title "$tag" --generate-notes
 
       # npm requires the FIRST publish of a new package name to be done by
       # the package owner interactively — skip green with the exact bootstrap
