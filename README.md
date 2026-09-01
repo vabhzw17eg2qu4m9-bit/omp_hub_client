@@ -15,13 +15,23 @@ identity, with durable inbox delivery into the agent loop.
 
 Requires Node ≥ 24 (npm 12).
 
+Install as a pi/omp plugin — one command, no config edits:
+
 ```sh
-npm i -g omp_hub_client
+omp install npm:omp_hub_client
 ```
 
-Then register the extension with omp — either one-shot:
+(`pi install npm:omp_hub_client` on the pi binary — same package.)
+
+This installs the package into omp's plugin root (`~/.omp/plugins`), validates
+the extension, and enables it for every project. Manage it with
+`omp plugin list` / `omp plugin uninstall omp_hub_client`. Restart omp (or run
+`/reload-plugins`) after installing.
+
+Manual alternatives — load from the global npm install:
 
 ```sh
+npm i -g omp_hub_client
 omp -e "$(npm root -g)/omp_hub_client"
 ```
 
@@ -32,12 +42,12 @@ extensions:
   - /absolute/path/to/global/node_modules/omp_hub_client
 ```
 
-For local development, clone and load straight from the checkout:
+For local development, `omp plugin link` a checkout (or point `-e` at it):
 
 ```sh
 git clone https://github.com/vabhzw17eg2qu4m9-bit/omp_hub_client && cd omp_hub_client
 npm install && npm run build
-omp -e "$(pwd)"
+omp plugin link "$(pwd)"
 ```
 
 ## Usage

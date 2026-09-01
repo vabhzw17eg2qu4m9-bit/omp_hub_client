@@ -18,15 +18,24 @@
   },
   "homepage": "https://github.com/vabhzw17eg2qu4m9-bit/omp_hub_client#readme",
   "keywords": [
-    "dap",
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
     "omp",
     "oh-my-pi",
+    "dap",
     "agents",
     "websocket",
     "e2e"
   ],
   "engines": {
     "node": ">=24"
+  },
+  "pi": {
+    "extensions": ["./dist/index.js"]
+  },
+  "omp": {
+    "extensions": ["./dist/index.js"]
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
