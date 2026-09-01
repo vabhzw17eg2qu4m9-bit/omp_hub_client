@@ -18,4 +18,10 @@
 
 - feat(install): pi/omp plugin-manifest support — pi+omp extensions manifests, canonical 'omp install npm:omp_hub_client' README install path, pi-package keywords
 
+## 0.1.5
+
+- fix(install): dial the hub only when a session starts — install/validation opens no connection (owner rule); fake ctx auto-fires session_start like real omp
+- fix(install): unref reconnect timers + hub socket (keepalive.ts pattern) — omp plugin-install validation ran the factory with no session and the ref'd reconnect loop hung the install CLI forever; session semantics unchanged (50/50 green)
+- fix(install): manifest points at committed src/index.ts (dist/ is gitignored — git-spec installs failed validation); tarball ships src+dist
+
 ## Unreleased
