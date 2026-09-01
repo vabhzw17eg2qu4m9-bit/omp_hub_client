@@ -83,6 +83,15 @@ Zero-config by default; resolution order is explicit override > environment >
 First connect to a new hub needs `DAP_MASTER_SECRET` set (enrolls once, then
 the issued client secret is stored in `~/.dap/config.json`).
 
+## Releases
+
+Every push to `main` gets an automated patch release (version bump, CHANGELOG
+entry, annotated tag, GitHub Release) and is published to npm via
+[trusted publishing](https://docs.npmjs.com/guides/publishing-to-npm-with-trusted-publishing)
+(OIDC — no tokens or secrets stored anywhere), coalesced to at most one
+release per 2 hours. Pushed `v*` tags publish the matching `package.json`
+version directly.
+
 ## Protocol
 
 DAP protocol documentation lives in the
