@@ -66,7 +66,11 @@ interface Captured {
   fire(event: string, sctx: SessionCtx): void;
 }
 
-/** Fake ExtensionAPI matching the real omp surface exactly. */
+/** Fake ExtensionAPI matching the real omp surface exactly. Real omp starts
+ * a session right after extension load — the fake mirrors that by firing
+ * session_start on the next microtask with a headless, no-op sctx (the
+ * extension dials the hub from session_start, never at load/install). A
+ * test that fires session_start itself wins; the auto-fire steps aside. */
 function fakeCtx(): Captured {
   const tools = new Map<string, ToolDefinition>();
   const sent: Captured['sent'] = [];
@@ -74,12 +78,26 @@ function fakeCtx(): Captured {
   const labels: string[] = [];
   const handlers = new Map<string, (event: unknown, ctx: SessionCtx) => void | Promise<void>>();
   const commands = new Map<string, CapturedCommand>();
+  const headless: SessionCtx = {
+    hasUI: false,
+    isIdle: () => true,
+    setInterval: () => undefined,
+    clearTimer: () => {},
+  };
+  let sessionStarted = false;
   const ctx: ExtensionAPI = {
     registerTool: (tool) => void tools.set(tool.name, tool),
     sendMessage: (msg, opts) => void sent.push({ msg, opts }),
     appendEntry: (type, data) => void entries.push({ type, data }),
     setLabel: (label) => void labels.push(label),
-    on: (event, handler) => void handlers.set(event, handler),
+    on: (event, handler) => {
+      void handlers.set(event, handler);
+      if (event === 'session_start') {
+        queueMicrotask(() => {
+          if (!sessionStarted) void handler(event, headless);
+        });
+      }
+    },
     registerCommand: (name, def) => void commands.set(name, def),
   };
   return {
@@ -89,7 +107,10 @@ function fakeCtx(): Captured {
     entries,
     labels,
     commands,
-    fire: (event, sctx) => void handlers.get(event)?.(event, sctx),
+    fire: (event, sctx) => {
+      if (event === 'session_start') sessionStarted = true;
+      void handlers.get(event)?.(event, sctx);
+    },
   };
 }
 

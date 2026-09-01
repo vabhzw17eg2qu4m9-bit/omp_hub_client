@@ -144,7 +144,14 @@ export class DapClient {
     this.delay = this.backoff.initial;
     this.timers =
       opts.timers ?? {
-        setInterval: (fn, ms) => setInterval(fn, ms),
+        // unref (keepalive.ts pattern): the reconnect loop must never own the
+        // process — omp's plugin-install validation runs this factory with no
+        // session, and a ref'd interval would hang the install CLI forever.
+        setInterval: (fn, ms) => {
+          const t = setInterval(fn, ms);
+          (t as NodeJS.Timeout).unref?.();
+          return t;
+        },
         clearInterval: (h) => clearInterval(h as TimerHandle),
       };
     this.watchdog = new KeepAliveWatchdog({ ...DEFAULT_KEEP_ALIVE, ...opts.keepAlive });
@@ -160,6 +167,11 @@ export class DapClient {
     this.enrollPending = masterSecret !== undefined;
     const ws = new WebSocket(this.opts.url, token ? { headers: { Authorization: `Bearer ${token}` } } : {});
     this.ws = ws;
+    // The socket must not own the process lifetime either (install-validation
+    // exit); frames still arrive while the host loop is alive.
+    // Unchecked cast: ws's public type hides the live net socket (_socket).
+    const rawSocket = ws as unknown as { _socket?: { unref?: () => void } };
+    ws.on('open', () => rawSocket._socket?.unref?.());
     ws.on('error', () => {}); // 'close' always follows; schedule from there
     // Registered so ws emits 'unexpected-response' instead of a generic
     // 'error' — the HTTP status is the auth verdict (hub 401s pre-upgrade).

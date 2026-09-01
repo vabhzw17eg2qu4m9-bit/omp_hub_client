@@ -157,6 +157,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       .join(',');
     ui?.setStatus?.('dap', `DAP ${who} · ${host} · ${state}${chans ? ' · ' + chans : ''}`);
   };
+  let started = false; // one dial per process: the FIRST session connects
   ctx.on('session_start', (_event, sctx) => {
     ui = sctx.ui;
     pollerCtx = sctx; // managed timers for the pending-invite poller
@@ -165,6 +166,13 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
       sctx.ui.notify(`DAP connected as ${client.agentId}${settings.name ? ` (${settings.name})` : ''}`, 'info');
     }
     renderStatus(client.connected ? 'connected' : 'connecting…');
+    // Owner rule: install/validation opens NO connection — the dial happens
+    // when the harness session itself starts. A reused client is already
+    // connected.
+    if (!started && created) {
+      started = true;
+      client.connect();
+    }
   });
   const inbox = new Inbox(100, (entry) => ctx.appendEntry('io.dap.message', entry));
   // Explicit channel maps (tests) opt out of the channels-file lifecycle;
@@ -646,6 +654,5 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   // Clean exit: closing the socket lets the hub deregister immediately
   // (identity + mailbox survive for offline DMs).
   ctx.on('session_shutdown', dispose);
-  if (created) client.connect(); // a reused client is already connected
   return { client, inbox, dispose };
 }
