@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  QUALITY GATE — DO NOT LOWER THESE THRESHOLDS WITHOUT TEAM APPROVAL       ║
+# ║  Every commit must pass: file size, typecheck, tests,                     ║
+# ║  coverage ≥ 80%, duplication < 1%.                                        ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+#
+# Pre-commit hook for omp_hub_client (TypeScript / node:test).
+# Canonical copy: scripts/pre-commit — install with:
+#   cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# To skip (emergency only): git commit --no-verify
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Unset git env vars so test processes that spawn git subprocesses use the
+# correct working directory rather than the hook's environment.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE 2>/dev/null || true
+
+# Measured: coverage 98.61% lines on src/ (c8), duplication 0.0% (jscpd).
+COVERAGE_BASELINE=80.0
+DUP_THRESHOLD=1.0        # max(1.0, measured 0.0 + 0.5)
+MAX_LINES=2800
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 1. FILE SIZE GUARD
+# ═══════════════════════════════════════════════════════════════════════════
+VIOLATIONS=()
+while IFS= read -r file; do
+  lines=$(wc -l < "$file")
+  if (( lines > MAX_LINES )); then
+    VIOLATIONS+=("  $file: $lines lines (max $MAX_LINES)")
+  fi
+done < <(git diff --cached --name-only --diff-filter=ACM -- '*.ts')
+
+if ((${#VIOLATIONS[@]} > 0)); then
+  echo ""
+  echo "╔═══════════════════════════════════════════════════════════════════════════╗"
+  echo "║  ❌ QUALITY GATE FAILED — FILE SIZE                                       ║"
+  echo "╚═══════════════════════════════════════════════════════════════════════════╝"
+  printf '%s\n' "${VIOLATIONS[@]}"
+  exit 1
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. TYPECHECK
+# ═══════════════════════════════════════════════════════════════════════════
+echo "🔍 Running tsc --noEmit..."
+npm run typecheck
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3. TESTS WITH COVERAGE
+# ═══════════════════════════════════════════════════════════════════════════
+echo "🧪 Running tests with coverage..."
+rm -rf coverage
+npm run coverage
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4. COVERAGE RATCHET (src/ only)
+# ═══════════════════════════════════════════════════════════════════════════
+echo "🔍 Checking line coverage (baseline: >= ${COVERAGE_BASELINE}%)..."
+if python3 - "$COVERAGE_BASELINE" <<'PYEOF'
+import os
+import sys
+
+baseline = float(sys.argv[1])
+if not os.path.isfile("coverage/lcov.info"):
+    print("ERROR: coverage/lcov.info not found. Run: npm run coverage")
+    sys.exit(1)
+
+total_found = 0
+total_hit = 0
+for sec in open("coverage/lcov.info").read().split("SF:")[1:]:
+    lines = sec.strip().split("\n")
+    path = lines[0]
+    relpath = os.path.relpath(path)
+    if not (relpath.startswith("src/") or "/src/" in path):
+        continue
+    for line in lines[1:]:
+        if line.startswith("DA:"):
+            total_found += 1
+            if int(line[3:].split(",")[1]) > 0:
+                total_hit += 1
+
+if total_found == 0:
+    print("ERROR: no src/ coverage data found in lcov.info")
+    sys.exit(1)
+
+pct = 100.0 * total_hit / total_found
+print(f"Coverage (src/): {pct:.2f}% ({total_hit}/{total_found} lines), baseline {baseline}%")
+sys.exit(0 if pct >= baseline else 1)
+PYEOF
+then
+  echo "✅ Coverage gate OK"
+else
+  echo ""
+  echo "╔═══════════════════════════════════════════════════════════════════════════╗"
+  echo "║  ❌ QUALITY GATE FAILED — TEST COVERAGE                                   ║"
+  echo "╚═══════════════════════════════════════════════════════════════════════════╝"
+  echo "   Add tests for uncovered code, then retry."
+  exit 1
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. CODE DUPLICATION GUARD (src/)
+# ═══════════════════════════════════════════════════════════════════════════
+if command -v npx >/dev/null 2>&1; then
+  echo "🔍 Checking code duplication (threshold < ${DUP_THRESHOLD}%)..."
+  # jscpd exits non-zero when duplication exceeds --threshold.
+  npx -y jscpd --min-tokens 50 --min-lines 5 \
+    --threshold "$DUP_THRESHOLD" --reporters consoleFull src/
+  echo "✅ Duplication gate OK (< ${DUP_THRESHOLD}%)"
+else
+  echo "⚠️  npx not found, skipping duplication check (npm install -g jscpd)"
+fi
+
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════════════════╗"
+echo "║  ✅ ALL QUALITY GATES PASSED — COMMIT APPROVED                            ║"
+echo "╚═══════════════════════════════════════════════════════════════════════════╝"
