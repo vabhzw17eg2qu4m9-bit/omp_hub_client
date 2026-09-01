@@ -14,4 +14,8 @@
 - feat(release): immediate release+publish per push — drop the 2h coalesce window inherited from fah (pub.dev quota does not apply to npm); drop the catch-up cron
 - fix(ci): manual tag path backfills the GitHub Release page — a pushed v* tag skipped the release job, leaving the Releases list and badge one version behind npm
 
+## 0.1.4
+
+- feat(install): pi/omp plugin-manifest support — pi+omp extensions manifests, canonical 'omp install npm:omp_hub_client' README install path, pi-package keywords
+
 ## Unreleased
