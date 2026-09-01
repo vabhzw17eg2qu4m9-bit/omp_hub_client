@@ -20,9 +20,9 @@ git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 # Emit a job output line when running under Actions (no-op locally).
 out() { if [ -n "${GITHUB_OUTPUT:-}" ]; then printf '%s\n' "$1" >>"$GITHUB_OUTPUT"; fi; }
 
-# Coalescing guards: npm rate-limits publishes far below commit pace, so
-# releases are capped at one per 2h; runs with nothing new since the last
-# tag are skipped.
+# Loop guard only: runs with nothing new since the last tag are skipped.
+# No time-based coalescing — npm has no pub.dev-style publish quota, so
+# every push to main releases immediately.
 git fetch origin main --tags --quiet
 last_tag=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
 if [ -n "$last_tag" ]; then
@@ -30,12 +30,6 @@ if [ -n "$last_tag" ]; then
   if [ "$pending" -eq 0 ]; then
     out "released=false"
     echo "Auto-release: nothing new since $last_tag, skipping."
-    exit 0
-  fi
-  tag_age=$(( $(date +%s) - $(git log -1 --format=%ct "$last_tag") ))
-  if [ "$tag_age" -lt 7200 ]; then
-    out "released=false"
-    echo "Auto-release: coalesced — $last_tag is ${tag_age}s old (<2h); $pending commit(s) pending. Next eligible push or the 2h cron will release them."
     exit 0
   fi
 fi
