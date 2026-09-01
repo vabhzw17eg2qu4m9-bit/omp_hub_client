@@ -1,6 +1,6 @@
 {
   "name": "omp_hub_client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DAP/1 hub client extension for oh-my-pi: channels, DM, presence, invites as tools + /dap commands + footer status",
   "type": "module",
   "main": "dist/index.js",
