@@ -24,4 +24,8 @@
 - fix(install): unref reconnect timers + hub socket (keepalive.ts pattern) — omp plugin-install validation ran the factory with no session and the ref'd reconnect loop hung the install CLI forever; session semantics unchanged (50/50 green)
 - fix(install): manifest points at committed src/index.ts (dist/ is gitignored — git-spec installs failed validation); tarball ships src+dist
 
+## 0.1.6
+
+- fix: extension inert without DAP_MASTER_SECRET
+
 ## Unreleased
