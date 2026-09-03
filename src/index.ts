@@ -62,6 +62,47 @@ const hostOf = (url: string): string => url.replace(/^wss?:\/\//, '').replace(/\
  *  surfaced via surface() so the verdict reaches the user even headless. */
 const DENIED_HINT =
   'hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect';
+/** Owner gate: without DAP_MASTER_SECRET (unset or empty) the whole
+ *  extension stays inert — no socket, no reconnect, no poller, no footer.
+ *  The one honest error every gated tool/command answers with. */
+export const DISABLED_ERROR = 'DAP_MASTER_SECRET is not set — DAP disabled';
+
+/** Gate-closed twin of dapExtension: registers the same tool and command
+ *  names so every invocation gets the honest error, but constructs no
+ *  client, dials nothing, starts no poller and prints nothing on startup. */
+function disabledExtension(ctx: ExtensionAPI): DapExtension {
+  const fail = (): AgentToolResult => toolResult({ ok: false, error: DISABLED_ERROR });
+  for (const name of [
+    'dap_send',
+    'dap_dm',
+    'dap_invite',
+    'dap_inbox',
+    'dap_whois',
+    'dap_status',
+    'dap_peers',
+    'dap_connect',
+  ]) {
+    ctx.registerTool({
+      name,
+      description: `DAP tool: ${DISABLED_ERROR}`,
+      parameters: { type: 'object', properties: {} },
+      execute: async () => fail(),
+    });
+  }
+  const failCommand = (name: string, description: string): void =>
+    ctx.registerCommand?.(name, {
+      description,
+      handler: (_args: string, cmdCtx?: CommandCtx): string => {
+        // omp discards handler return values — the verdict goes through the UI.
+        cmdCtx?.ui?.notify(DISABLED_ERROR, 'error');
+        return DISABLED_ERROR;
+      },
+    });
+  failCommand('dap', '/dap — connect to a DAP hub or invite a peer');
+  failCommand('dap_status', '/dap_status — own DAP connection status');
+  failCommand('dap_peers', '/dap_peers — online agents on the hub');
+  return { dispose() {} } as unknown as DapExtension; // no client/inbox exist while gated
+}
 
 /** Injection text: enough context for the steered turn to answer in-channel. */
 function formatEntry(entry: InboxEntry, peerName: string): string {
@@ -112,12 +153,14 @@ const sharedClients = new Map<string, SharedClient>();
 /**
  * oh-my-pi DAP/1 extension. Default-export factory:
  * registers dap_send/dap_dm/dap_invite/dap_inbox/dap_whois tools, keeps one
- * outbound WS to the hub (signed hello, flush after welcome, setInterval
- * reconnect), and delivers inbound msg frames as steer injections + durable
  * inbox entries. Channel keys auto-generate on first send and persist to
  * ~/.dap/channels.json; invites travel as E2E DMs (see dap_invite).
  */
 export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOptions = {}): DapExtension {
+  // Owner gate: the FIRST statement, before any side effect (key file,
+  // socket, timers, footer) — without DAP_MASTER_SECRET the extension does
+  // nothing and shows nothing.
+  if (optStr(process.env.DAP_MASTER_SECRET) === undefined) return disabledExtension(ctx);
   const settings = resolveDapSettings(overrides);
   let keys: KeyPair = loadOrCreateKeys(settings.keyPath);
 

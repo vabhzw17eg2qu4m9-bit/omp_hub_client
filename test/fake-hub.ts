@@ -339,7 +339,8 @@ export class FakeHub {
   /** Enroll op (master-auth connections only): issue a fresh 32-byte
    *  base64url client secret and accept it as bearer on later dials. */
   private enroll(ws: WebSocket, agentId: string, bearer: string | undefined): undefined {
-    if (bearer === undefined || bearer !== this.masterSecret) {
+    if (this.masterSecret === undefined) return undefined; // open hub: no auth, nothing to issue
+    if (bearer !== this.masterSecret) {
       this.error(ws, 'not_master_auth');
       return undefined;
     }
