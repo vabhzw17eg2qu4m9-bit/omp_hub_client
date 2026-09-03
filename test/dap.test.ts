@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import dapExtension, { type DapExtension } from '../src/index.js';
+import dapExtension, { type DapExtension, DISABLED_ERROR } from '../src/index.js';
 import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys, unb64 } from '../src/crypto.js';
 import { persistDapConfig, readDapConfig, resolveDapSettings } from '../src/config.js';
 import { loadChannelKeys, newChannelKeypair } from '../src/channels.js';
@@ -22,6 +22,10 @@ process.env.HOME = KEYDIR;
 const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CLIENT_SECRET', 'DAP_MASTER_SECRET'];
 const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
 for (const k of DAP_ENV_KEYS) delete process.env[k];
+// Suite default: the DAP_MASTER_SECRET gate keeps the extension inert
+// without the secret, so every connect-path test runs with one set. Tests
+// of the gate itself save/delete/restore it locally.
+process.env.DAP_MASTER_SECRET = 'test-master';
 
 test.after(() => {
   for (const [k, v] of Object.entries(savedEnv)) {
@@ -343,6 +347,7 @@ async function deniedHub(): Promise<{ url: string; seen: (string | undefined)[];
 
 test('dial carries Authorization: Bearer (clientSecret, or DAP_MASTER_SECRET in enroll mode)', async () => {
   const hub = await deniedHub();
+  const prevMaster = process.env.DAP_MASTER_SECRET;
   let c = new DapClient({ url: hub.url, keys: loadOrCreateKeys(nextKeyPath()), clientSecret: 'client-secret-1' });
   try {
     const denied = nextEvent(c, 'denied');
@@ -358,7 +363,8 @@ test('dial carries Authorization: Bearer (clientSecret, or DAP_MASTER_SECRET in 
     await denied2;
     assert.deepEqual(hub.seen, ['Bearer client-secret-1', 'Bearer master-secret-1'], 'master secret dials in enroll mode');
   } finally {
-    delete process.env.DAP_MASTER_SECRET;
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
     c.stop();
     await hub.close();
   }
@@ -380,7 +386,11 @@ test('token precedence: DAP_CLIENT_SECRET env beats the persisted config clientS
     ext.dispose();
     delete process.env.DAP_CLIENT_SECRET;
     ext = dapExtension(fakeCtx().ctx, { url: hub.url, keyPath: nextKeyPath(), timers: clock.timers });
-    await nextEvent(ext.client, 'denied');
+    const denied2 = nextEvent(ext.client, 'denied');
+    const closed2 = nextEvent(ext.client, 'close');
+    await closed2; // dial 1 (config bearer) 401'd: escalation armed silently
+    clock.fireAll(); // dial 2: master bearer -> 401 -> denied
+    await denied2;
     assert.equal(hub.seen[1], 'Bearer from-config', 'persisted clientSecret used when env is silent');
   } finally {
     if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
@@ -392,7 +402,7 @@ test('token precedence: DAP_CLIENT_SECRET env beats the persisted config clientS
   }
 });
 
-test('headerless dial: hub 401 surfaces the frozen error text (once per streak)', async () => {
+test('master dial rejected: hub 401 surfaces the frozen error text (once per streak)', async () => {
   const hub = await deniedHub();
   const cap = fakeCtx();
   const clock = new ManualTimers();
@@ -406,7 +416,7 @@ test('headerless dial: hub 401 surfaces the frozen error text (once per streak)'
     await nextEvent(ext.client, 'close');
     clock.fireAll(); // dial 3
     await nextEvent(ext.client, 'close');
-    assert.deepEqual(hub.seen, [undefined, undefined, undefined], 'no secrets: headerless dials');
+    assert.deepEqual(hub.seen, ['Bearer test-master', 'Bearer test-master', 'Bearer test-master'], 'enroll-mode bearer on every rejected dial');
     assert.deepEqual(cap.sent.map((s) => s.msg), [
       '[dap] hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect',
     ]);
@@ -540,7 +550,9 @@ test('config-sourced clientSecret, no master: 401 hard-fails, cache kept', async
   const cfgFile = path.join(KEYDIR, 'cfg-nomaster-' + ++keySeq + '.json');
   fs.writeFileSync(cfgFile, JSON.stringify({ clientSecret: 'from-config' }));
   const prevCfg = process.env.DAP_CONFIG_FILE;
-  process.env.DAP_CONFIG_FILE = cfgFile; // no DAP_MASTER_SECRET anywhere
+  const prevMaster = process.env.DAP_MASTER_SECRET;
+  delete process.env.DAP_MASTER_SECRET; // premise: nothing to escalate to
+  process.env.DAP_CONFIG_FILE = cfgFile;
   const clock = new ManualTimers();
   const c = new DapClient({
     url: hub.url,
@@ -563,6 +575,8 @@ test('config-sourced clientSecret, no master: 401 hard-fails, cache kept', async
   } finally {
     if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
     else process.env.DAP_CONFIG_FILE = prevCfg;
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
     c.stop();
     await hub.close();
   }
@@ -1831,6 +1845,134 @@ test('live DM: a second session claiming the shared client must not steal delive
   } finally {
     extA.dispose();
     extR.dispose();
+    await hub.close();
+  }
+});
+
+// --- DAP_MASTER_SECRET gate -------------------------------------------------
+
+test('gate: no DAP_MASTER_SECRET -> the extension starts nothing and shows nothing', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const status: string[] = [];
+  const notified: string[] = [];
+  const keyPath = nextKeyPath();
+  const prev = process.env.DAP_MASTER_SECRET;
+  delete process.env.DAP_MASTER_SECRET;
+  try {
+    const ext = dapExtension(cap.ctx, {
+      url: hub.url,
+      keyPath,
+      channelsFile: path.join(KEYDIR, 'ch-gate-' + ++keySeq + '.json'),
+    });
+    // The gated extension registers no session_start handler: firing it
+    // (with a live UI, as the real harness does) must be a complete no-op.
+    cap.fire('session_start', {
+      hasUI: true,
+      isIdle: () => false,
+      ui: {
+        notify: (t: string) => void notified.push(t),
+        setStatus: (_k: string, text: string | undefined) => void status.push(text ?? 'CLEARED'),
+      },
+      setInterval: () => 0,
+      clearTimer: () => {},
+    });
+    await microtasksSettled();
+    assert.equal(ext.client, undefined, 'no client constructed: no socket, no reconnect, no poller');
+    assert.equal(hub.upgrades.length, 0, 'zero connection attempts');
+    assert.equal(status.length, 0, 'ui.setStatus never called');
+    assert.equal(notified.length, 0, 'no ui.notify on startup');
+    assert.equal(cap.sent.length, 0, 'no steers');
+    assert.equal(cap.entries.length, 0, 'no durable entries');
+    assert.ok(!fs.existsSync(keyPath), 'no identity key written');
+    ext.dispose(); // inert: stops nothing because nothing was started
+    assert.equal(hub.upgrades.length, 0, 'dispose dials nothing');
+    // Every tool answers with the one honest error.
+    assert.deepEqual(await run<{ ok: boolean; error: string }>(cap, 'dap_send', { channel: 'general', text: 'hi' }), {
+      ok: false,
+      error: DISABLED_ERROR,
+    });
+    assert.deepEqual(await run<{ ok: boolean; error: string }>(cap, 'dap_invite', { channel: 'general', to: '0123456789abcdef' }), {
+      ok: false,
+      error: DISABLED_ERROR,
+    });
+    // /dap and /dap invite print the honest error (return value + ui).
+    for (const args of ['', 'invite peer']) {
+      const out = command(cap, 'dap').handler(args, { ui: { notify: (t: string) => void notified.push(t) } });
+      assert.equal(out, DISABLED_ERROR);
+    }
+    assert.deepEqual(notified, [DISABLED_ERROR, DISABLED_ERROR], 'commands print exactly the honest error');
+    assert.equal(status.length, 0, 'still no footer output');
+    assert.equal(hub.upgrades.length, 0, 'gated invocations never dial');
+  } finally {
+    if (prev === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prev;
+    await hub.close();
+  }
+});
+
+test('gate: an empty DAP_MASTER_SECRET is equally inert', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const status: string[] = [];
+  const prev = process.env.DAP_MASTER_SECRET;
+  process.env.DAP_MASTER_SECRET = '';
+  try {
+    const ext = dapExtension(cap.ctx, {
+      url: hub.url,
+      keyPath: nextKeyPath(),
+      channelsFile: path.join(KEYDIR, 'ch-gate2-' + ++keySeq + '.json'),
+    });
+    cap.fire('session_start', {
+      hasUI: true,
+      isIdle: () => false,
+      ui: { notify: () => {}, setStatus: (_k: string, text: string | undefined) => void status.push(text ?? 'CLEARED') },
+      setInterval: () => 0,
+      clearTimer: () => {},
+    });
+    await microtasksSettled();
+    assert.equal(ext.client, undefined, 'empty string counts as unset');
+    assert.equal(hub.upgrades.length, 0, 'zero connection attempts');
+    assert.equal(status.length, 0, 'no footer output');
+  } finally {
+    if (prev === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prev;
+    await hub.close();
+  }
+});
+
+test('gate: DAP_MASTER_SECRET set -> connect and footer behave exactly as before', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const status: string[] = [];
+  const prev = process.env.DAP_MASTER_SECRET;
+  process.env.DAP_MASTER_SECRET = 'gate-on-master';
+  const channel = newChannelKeypair(); // real X25519 keys: the send must encrypt
+  try {
+    const ext = dapExtension(cap.ctx, {
+      url: hub.url,
+      keyPath: nextKeyPath(),
+      name: 'gate-on',
+      channels: { general: channel.pub },
+    });
+    assert.ok(ext.client, 'client constructed when the secret is set');
+    cap.fire('session_start', {
+      hasUI: true,
+      isIdle: () => false,
+      ui: { notify: () => {}, setStatus: (_k: string, text: string | undefined) => void status.push(text ?? 'CLEARED') },
+      setInterval: () => 0,
+      clearTimer: () => {},
+    });
+    assert.match(status.at(-1)!, /connecting/);
+    await nextEvent(ext.client, 'welcome');
+    assert.match(status.at(-1)!, /connected/);
+    assert.deepEqual(hub.upgrades, ['gate-on-master'], 'dialed the hub with the master bearer');
+    const sent = await run<{ ok: boolean }>(cap, 'dap_send', { channel: 'general', text: 'hi' });
+    assert.equal(sent.ok, true, 'send path unchanged');
+    ext.dispose();
+  } finally {
+    if (prev === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prev;
     await hub.close();
   }
 });
