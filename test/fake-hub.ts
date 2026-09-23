@@ -59,8 +59,10 @@ export class FakeHub {
   private readonly masterSecret: string | undefined;
   /** Authorization bearer captured per upgrade attempt (test assertions). */
   readonly upgrades: (string | undefined)[] = [];
-  /** Secrets issued via {"t":"enroll"} — accepted as bearer on later dials. */
-  private readonly issuedSecrets = new Set<string>();
+  /** Secrets issued via {"t":"enroll"}, bound to the hello NAME they were
+   *  enrolled under — accepted as bearer on later dials BY THAT NAME only
+   *  (real-hub law: the hello must repeat the enrolled name). */
+  private readonly issuedSecrets = new Map<string, string | undefined>();
   /** agentIds that enrolled (asserts hello-before-enroll, one per connection). */
   readonly enrollRequests: string[] = [];
   port = 0;
@@ -152,7 +154,7 @@ export class FakeHub {
       this.error(ws, 'bad_frame');
       return undefined;
     }
-    if (frame.op === 'hello') return this.hello(ws, frame);
+    if (frame.op === 'hello') return this.hello(ws, frame, bearer);
     if (!agentId) {
       this.error(ws, 'not_authenticated');
       return undefined;
@@ -167,7 +169,7 @@ export class FakeHub {
     return undefined;
   }
 
-  private hello(ws: WebSocket, frame: Record<string, unknown>): string | undefined {
+  private hello(ws: WebSocket, frame: Record<string, unknown>, bearer: string | undefined): string | undefined {
     const id = agentIdFor(unb64(String(frame.pubkey)));
     if (Math.abs(Date.now() - Number(frame.ts)) > 300_000) {
       this.reject(ws, id, 'stale_ts');
@@ -180,6 +182,21 @@ export class FakeHub {
     }
     if (!verifies(unb64(String(frame.pubkey)), 'hello', frame)) {
       this.reject(ws, id, 'bad_signature');
+      return undefined;
+    }
+    // Issued-secret binding (real-hub law): a client-secret bearer is only
+    // valid for the identity NAME it was enrolled under. Another identity
+    // on the same host reusing the secret (the shared-config-field bug)
+    // gets the production rejection, name and code included.
+    if (
+      bearer !== undefined &&
+      bearer !== this.masterSecret &&
+      this.issuedSecrets.has(bearer) &&
+      this.issuedSecrets.get(bearer) !== optName(frame.name)
+    ) {
+      this.rejected.push({ code: 'access_denied', agentId: id });
+      this.error(ws, 'access_denied', 'hello name does not match the enrolled secret');
+      ws.close();
       return undefined;
     }
     this.noncesSeen.add(nonce);
@@ -332,12 +349,13 @@ export class FakeHub {
     ws.close();
   }
 
-  private error(ws: WebSocket, code: string): void {
-    ws.send(JSON.stringify({ op: 'error', code, msg: code }));
+  private error(ws: WebSocket, code: string, msg: string = code): void {
+    ws.send(JSON.stringify({ op: 'error', code, msg }));
   }
 
   /** Enroll op (master-auth connections only): issue a fresh 32-byte
-   *  base64url client secret and accept it as bearer on later dials. */
+   *  base64url client secret and accept it as bearer on later dials — bound
+   *  to the enrolling connection's hello NAME (see hello). */
   private enroll(ws: WebSocket, agentId: string, bearer: string | undefined): undefined {
     if (this.masterSecret === undefined) return undefined; // open hub: no auth, nothing to issue
     if (bearer !== this.masterSecret) {
@@ -345,7 +363,7 @@ export class FakeHub {
       return undefined;
     }
     const secret = randomBytes(32).toString('base64url');
-    this.issuedSecrets.add(secret);
+    this.issuedSecrets.set(secret, this.agents.get(agentId)?.name);
     this.enrollRequests.push(agentId);
     ws.send(JSON.stringify({ t: 'enrolled', secret }));
     return undefined;

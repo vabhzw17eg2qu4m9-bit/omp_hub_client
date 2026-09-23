@@ -6,7 +6,14 @@ import os from 'node:os';
 import path from 'node:path';
 import dapExtension, { type DapExtension, DISABLED_ERROR } from '../src/index.js';
 import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys, unb64 } from '../src/crypto.js';
-import { persistDapConfig, readDapConfig, resolveDapSettings, randomAgentName } from '../src/config.js';
+import {
+  clientSecretForKey,
+  defaultKeyPath,
+  persistDapConfig,
+  readDapConfig,
+  resolveDapSettings,
+  randomAgentName,
+} from '../src/config.js';
 import { loadChannelKeys, newChannelKeypair } from '../src/channels.js';
 import { DapClient, type MsgFrame, type Timers } from '../src/conn.js';
 import type { CommandCtx, ExtensionAPI, SendMessageOptions, SessionCtx, ToolDefinition } from '../src/types.js';
@@ -507,13 +514,14 @@ test('auto-enroll: master dial -> {"t":"enroll"} -> issued secret persisted and 
   process.env.DAP_MASTER_SECRET = 'master-enroll-token';
   const cap = fakeCtx();
   const clock = new ManualTimers();
-  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: nextKeyPath(), name: 'enrollee', timers: clock.timers });
+  const enrolleeKey = nextKeyPath();
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: enrolleeKey, name: 'enrollee', timers: clock.timers });
   try {
     const enrolled = nextEvent<{ secret: string }>(ext.client, 'enrolled');
     await nextEvent(ext.client, 'welcome');
     const { secret } = await enrolled;
     assert.deepEqual(hub.enrollRequests, [ext.client.agentId], 'enroll only after hello, master-auth only');
-    assert.equal(readDapConfig(cfgFile).clientSecret, secret, 'issued secret persisted to DAP_CONFIG_FILE');
+    assert.equal(readDapConfig(cfgFile).clientSecrets?.[enrolleeKey], secret, 'issued secret persisted to its identity slot in DAP_CONFIG_FILE');
     assert.ok(!fs.readFileSync(cfgFile, 'utf8').includes('master-enroll-token'), 'master secret never persisted');
     assert.ok(!JSON.stringify(cap.sent).includes(secret), 'secret never surfaces in messages');
 
@@ -531,6 +539,160 @@ test('auto-enroll: master dial -> {"t":"enroll"} -> issued secret persisted and 
     else process.env.DAP_CONFIG_FILE = prevCfg;
     if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
     else process.env.DAP_MASTER_SECRET = prevMaster;
+    ext.dispose();
+    await hub.close();
+  }
+});
+
+test('two identities on one host: each enrolls its OWN secret slot; reconnects never cross (the shared-field bug)', async () => {
+  const hub = await new FakeHub({ masterSecret: 'test-master' }).listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-two-' + ++keySeq + '.json');
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  const keyA = nextKeyPath();
+  const keyB = nextKeyPath();
+  const clockA = new ManualTimers();
+  const clockB = new ManualTimers();
+  const extA = dapExtension(fakeCtx().ctx, { url: hub.url, keyPath: keyA, name: 'one', timers: clockA.timers });
+  const extB = dapExtension(fakeCtx().ctx, { url: hub.url, keyPath: keyB, name: 'two', timers: clockB.timers });
+  try {
+    // Pre-register EVERY waiter before the first await: in-process hub I/O
+    // batches into one macrotask, so a waiter registered after a prior await
+    // misses emissions that already landed (eventCountAtLeast rationale).
+    const welcomeA = nextEvent(extA.client, 'welcome');
+    const enrolledA = nextEvent<{ secret: string }>(extA.client, 'enrolled');
+    const welcomeB = nextEvent(extB.client, 'welcome');
+    const enrolledB = nextEvent<{ secret: string }>(extB.client, 'enrolled');
+    await welcomeA;
+    const secretA = (await enrolledA).secret;
+
+    // The SECOND identity on the same host shares the config file — but not
+    // the secret: no slot of its own means a master (enroll-mode) dial, not
+    // a dial with identity one's secret that the hub would reject.
+    await welcomeB;
+    const secretB = (await enrolledB).secret;
+    assert.notEqual(secretB, secretA, 'each identity holds its own issued secret');
+
+    const saved = readDapConfig(cfgFile);
+    assert.equal(saved.clientSecrets?.[keyA], secretA, 'identity one: own slot');
+    assert.equal(saved.clientSecrets?.[keyB], secretB, 'identity two: own slot');
+    assert.equal(saved.clientSecret, undefined, 'no shared legacy field left behind');
+    assert.ok(!hub.rejected.some((r) => r.code === 'access_denied'), 'no name-mismatch rejection ever fired');
+
+    // Reconnect both: each dials with ITS OWN bearer; neither re-enrolls.
+    const closedA = nextEvent(extA.client, 'close');
+    hub.drop(extA.client.agentId);
+    await closedA;
+    const welcomeA2 = nextEvent(extA.client, 'welcome');
+    clockA.fireAll();
+    await welcomeA2;
+    const closedB = nextEvent(extB.client, 'close');
+    hub.drop(extB.client.agentId);
+    await closedB;
+    const welcomeB2 = nextEvent(extB.client, 'welcome');
+    clockB.fireAll();
+    await welcomeB2;
+    assert.deepEqual(hub.upgrades, ['test-master', 'test-master', secretA, secretB], 'each reconnect rides its own secret');
+    assert.deepEqual(hub.enrollRequests, [extA.client.agentId, extB.client.agentId], 'no re-enroll after the initial two');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});
+
+test('second identity reusing a legacy shared secret: post-hello access_denied wipes it, ONE master re-enroll recovers', async () => {
+  const hub = await new FakeHub({ masterSecret: 'test-master' }).listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-legacy2-' + ++keySeq + '.json');
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  // Seed a real enrollment (bound to the name 'first'), then rewrite the
+  // config to the OLD single-field shape — a pre-per-identity host.
+  const firstKey = nextKeyPath();
+  const extFirst = dapExtension(fakeCtx().ctx, { url: hub.url, keyPath: firstKey, name: 'first', timers: new ManualTimers().timers });
+  const enrolledFirst = nextEvent<{ secret: string }>(extFirst.client, 'enrolled');
+  await nextEvent(extFirst.client, 'welcome');
+  const secretFirst = (await enrolledFirst).secret;
+  const firstId = extFirst.client.agentId;
+  extFirst.dispose();
+  await hub.waitOffline(firstId);
+  fs.writeFileSync(cfgFile, JSON.stringify({ clientSecret: secretFirst }));
+
+  const cap = fakeCtx();
+  const clock = new ManualTimers();
+  const secondKey = nextKeyPath();
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: secondKey, name: 'second', timers: clock.timers });
+  try {
+    // All waiters pre-registered (macrotask batching — see the two-identities
+    // test): dial 1 (legacy bearer) must FULLY close before the reconnect
+    // clock fires, else fireAll() runs before the reconnect is scheduled.
+    const closed1 = nextEvent(ext.client, 'close');
+    const welcome2 = nextEvent(ext.client, 'welcome');
+    const enrolled2 = nextEvent<{ secret: string }>(ext.client, 'enrolled');
+    await closed1; // dial 1: legacy bearer upgraded fine, hello rejected in-band
+    clock.fireAll(); // dial 2: master bearer (the recovery)
+    await welcome2;
+    const secret2 = (await enrolled2).secret;
+
+    assert.ok(hub.rejected.some((r) => r.code === 'access_denied'), 'hub rejected the mismatched hello exactly as in production');
+    assert.deepEqual(hub.upgrades, ['test-master', secretFirst, 'test-master'], 'legacy secret passed the upgrade, failed the hello, master recovered');
+    assert.deepEqual(hub.enrollRequests, [firstId, ext.client.agentId], 'the second identity enrolled under its own name');
+    assert.notEqual(secret2, secretFirst);
+    const saved = readDapConfig(cfgFile);
+    assert.equal(saved.clientSecret, undefined, 'poisoned legacy field wiped');
+    assert.equal(saved.clientSecrets?.[secondKey], secret2, 'fresh secret in its own slot');
+    // The rejection surfaced once — never silent — and then recovery won.
+    assert.ok(
+      cap.sent.some((s) => s.msg.includes('access_denied') && s.msg.includes('hello name does not match the enrolled secret')),
+      'the production error text reached the user',
+    );
+    assert.equal(ext.client.connected, true, 'recovered: connected under the own name');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    ext.dispose();
+    await hub.close();
+  }
+});
+
+test('/dap retarget to a new name: dials with the NEW identity\u2019s secret (enroll-mode), never the old one\u2019s', async () => {
+  const hub = await new FakeHub({ masterSecret: 'test-master' }).listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-ret-' + ++keySeq + '.json');
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  const prevHome = process.env.HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-ret-'));
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  process.env.HOME = home; // defaultKeyPath('renamed') resolves under this home
+  const keyA = nextKeyPath();
+  const cap = fakeCtx();
+  const ext = dapExtension(cap.ctx, { url: hub.url, keyPath: keyA, name: 'orig' });
+  try {
+    const enrolled1 = nextEvent<{ secret: string }>(ext.client, 'enrolled');
+    await nextEvent(ext.client, 'welcome');
+    const secretA = (await enrolled1).secret;
+
+    // New name = new identity: no slot of its own -> enroll-mode dial (NOT
+    // the old identity's secret, which the hub rejects post-hello).
+    const enrolled2 = nextEvent<{ secret: string }>(ext.client, 'enrolled');
+    const welcome2 = nextEvent(ext.client, 'welcome');
+    const renamedKey = defaultKeyPath('renamed');
+    await run(cap, 'dap_connect', { host: `127.0.0.1:${hub.port}`, name: 'renamed' });
+    await welcome2;
+    const secretB = (await enrolled2).secret;
+
+    assert.deepEqual(hub.upgrades, ['test-master', 'test-master'], 'retarget dialed master (enroll), never the old secret');
+    assert.ok(!hub.rejected.some((r) => r.code === 'access_denied'), 'no name-mismatch rejection');
+    const saved = readDapConfig(cfgFile);
+    assert.equal(saved.clientSecrets?.[keyA], secretA, 'old identity slot untouched');
+    assert.equal(saved.clientSecrets?.[renamedKey], secretB, 'new identity got its own slot');
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    fs.rmSync(home, { recursive: true, force: true });
     ext.dispose();
     await hub.close();
   }
@@ -1237,6 +1399,38 @@ test('config back-compat: file without invites key loads (invites defaults to []
   assert.deepEqual(after.channels, ['ops']);
   fs.writeFileSync(cfgFile, JSON.stringify({ invites: 'corrupt' }));
   assert.deepEqual(readDapConfig(cfgFile).invites, [], 'non-array invites treated as absent');
+});
+
+test('per-identity secrets: slot beats legacy, upsert retires legacy, wipe clears slot + legacy, slots are private', () => {
+  const cfgFile = path.join(KEYDIR, 'cfg-slots-' + ++keySeq + '.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ clientSecret: 'legacy-secret' }));
+  // Legacy fallback: an identity with no slot of its own reads the shared field.
+  assert.equal(clientSecretForKey(readDapConfig(cfgFile), '/keys/a.key'), 'legacy-secret');
+  // Upsert: writes the identity's OWN slot and retires the shared field.
+  persistDapConfig({ clientSecret: 'secret-a', identityKey: '/keys/a.key' }, cfgFile);
+  let cfg = readDapConfig(cfgFile);
+  assert.equal(cfg.clientSecret, undefined, 'legacy field retired by a per-identity enrollment');
+  assert.equal(clientSecretForKey(cfg, '/keys/a.key'), 'secret-a');
+  assert.equal(clientSecretForKey(cfg, '/keys/b.key'), undefined, 'another identity does NOT inherit the slot');
+  // Second identity, same file: its own slot, the first one intact.
+  persistDapConfig({ clientSecret: 'secret-b', identityKey: '/keys/b.key' }, cfgFile);
+  cfg = readDapConfig(cfgFile);
+  assert.equal(clientSecretForKey(cfg, '/keys/a.key'), 'secret-a');
+  assert.equal(clientSecretForKey(cfg, '/keys/b.key'), 'secret-b');
+  // Stale wipe: clears the identity's slot and the legacy field, not others.
+  fs.writeFileSync(cfgFile, JSON.stringify({ clientSecret: 'legacy-again', clientSecrets: cfg.clientSecrets }));
+  persistDapConfig({ clientSecret: null, identityKey: '/keys/a.key' }, cfgFile);
+  cfg = readDapConfig(cfgFile);
+  assert.equal(cfg.clientSecret, undefined, 'legacy fallback wiped with the slot');
+  assert.equal(clientSecretForKey(cfg, '/keys/a.key'), undefined, 'wiped slot gone');
+  assert.equal(clientSecretForKey(cfg, '/keys/b.key'), 'secret-b', 'other identities keep their slots');
+  // No identityKey (standalone DapClient): legacy top-level behavior intact.
+  persistDapConfig({ clientSecret: 'plain' }, cfgFile);
+  assert.equal(readDapConfig(cfgFile).clientSecret, 'plain');
+  persistDapConfig({ clientSecret: null }, cfgFile);
+  cfg = readDapConfig(cfgFile);
+  assert.equal(cfg.clientSecret, undefined);
+  assert.equal(cfg.clientSecrets?.['/keys/b.key'], 'secret-b', 'slots untouched by legacy-path writes');
 });
 
 test('pending invites survive a restart: welcome-time check delivers without waiting a tick', async () => {

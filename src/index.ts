@@ -13,6 +13,7 @@ import {
   defaultKeyPath,
   persistDapConfig,
   readDapConfig,
+  clientSecretForKey,
   type PendingInvite,
 } from './config.js';
 import {
@@ -177,6 +178,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     timers: overrides.timers,
     clientSecret: settings.clientSecret,
     clientSecretSource: settings.clientSecretSource,
+    identityKey: settings.keyPath,
   });
   let shared: SharedClient | undefined;
   if (shareKey !== undefined) {
@@ -601,7 +603,22 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     if (host) settings.url = url;
     persistDapConfig({ url: host ? url : undefined, name, channels: channel ? [channel] : undefined }, configFile);
     if (channel && !cryptoCtx.channels[channel]) cryptoCtx.channels[channel] = createChannel(channel).pub;
-    client.retarget({ url: host ? url : undefined, keys: nextKeys, name });
+    // A new name is a NEW identity: its key file differs, and the hub binds
+    // an issued secret to the enrolled name — dialing the fresh identity
+    // with the previous one's secret is rejected ("hello name does not
+    //  match the enrolled secret"). Re-resolve the secret for the identity
+    // the retargeted client will run as: its own clientSecrets slot, the
+    // legacy shared field, or nothing (enroll-mode via the master secret).
+    const explicitSecret = optStr(process.env.DAP_CLIENT_SECRET);
+    const nextSecret = explicitSecret ?? clientSecretForKey(readDapConfig(configFile), settings.keyPath);
+    client.retarget({
+      url: host ? url : undefined,
+      keys: nextKeys,
+      name,
+      clientSecret: nextSecret,
+      clientSecretSource: explicitSecret !== undefined ? 'env' : nextSecret !== undefined ? 'config' : undefined,
+      identityKey: settings.keyPath,
+    });
     // Sessions spawned after this resolve the persisted url/name to nextKey —
     // re-key so they reuse this retargeted client instead of a second socket.
     const nextKey = settings.keyPath + '|' + settings.url;
