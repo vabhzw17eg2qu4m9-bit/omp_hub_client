@@ -28,4 +28,8 @@
 
 - fix: extension inert without DAP_MASTER_SECRET
 
+## 0.1.7
+
+- fix: extension failed to load and deliver on upstream pi
+
 ## Unreleased
