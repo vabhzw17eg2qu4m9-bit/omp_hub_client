@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import dapExtension, { type DapExtension, DISABLED_ERROR } from '../src/index.js';
 import { agentIdFor, b64, canonicalJSON, loadOrCreateKeys, unb64 } from '../src/crypto.js';
-import { persistDapConfig, readDapConfig, resolveDapSettings } from '../src/config.js';
+import { persistDapConfig, readDapConfig, resolveDapSettings, randomAgentName } from '../src/config.js';
 import { loadChannelKeys, newChannelKeypair } from '../src/channels.js';
 import { DapClient, type MsgFrame, type Timers } from '../src/conn.js';
 import type { CommandCtx, ExtensionAPI, SendMessageOptions, SessionCtx, ToolDefinition } from '../src/types.js';
@@ -799,19 +799,66 @@ test('offline mailbox: flush after welcome -> steer + durable inbox; inbox/whois
   }
 });
 
+test('default agent name: per-process random (hostname + 4 hex), unique per draw, stable within the process', () => {
+  const host =
+    os
+      .hostname()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]/g, '-')
+      .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
+      .slice(0, 24) || 'agent';
+  const re = new RegExp('^' + host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-[0-9a-f]{4}$');
+  const a = randomAgentName();
+  const b = randomAgentName();
+  assert.match(a, re, 'hostname-prefixed, 4 random hex chars');
+  assert.match(b, re);
+  assert.notEqual(a, b, 'two draws never share an identity (two processes coexist)');
+
+  // The resolver hands every unnamed session in THIS process the same
+  // memoized name (and key path) — one identity/socket per process.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-omp-rnd-'));
+  const prevHome = process.env.HOME;
+  const prevName = process.env.DAP_AGENT_NAME;
+  const prevKey = process.env.DAP_KEY_PATH;
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  process.env.HOME = home;
+  delete process.env.DAP_AGENT_NAME;
+  delete process.env.DAP_KEY_PATH;
+  delete process.env.DAP_CONFIG_FILE;
+  try {
+    const s1 = resolveDapSettings();
+    const s2 = resolveDapSettings();
+    assert.equal(s1.name, s2.name, 'memoized across resolutions');
+    assert.match(s1.name!, re);
+    assert.equal(s1.keyPath, path.join(home, '.dap', 'keys', `${s1.name}.key`));
+    assert.equal(s1.keyPath, s2.keyPath);
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    if (prevName === undefined) delete process.env.DAP_AGENT_NAME;
+    else process.env.DAP_AGENT_NAME = prevName;
+    if (prevKey === undefined) delete process.env.DAP_KEY_PATH;
+    else process.env.DAP_KEY_PATH = prevKey;
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+  }
+});
+
 test('settings precedence: override > env > ~/.dap/config.json > defaults; channelsFile default ~/.dap/channels.json', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dap-omp-cfg-'));
   const prevHome = process.env.HOME;
   process.env.HOME = home;
   try {
-    // No config file, no env: plain defaults. Identity file is derived from
-    // the agent name (hostname when unnamed) — two agents on one machine
-    // never collide, and it is auto-generated on first use.
+    // No config file, no env: plain defaults. Unnamed identity is the
+    // per-process random agent name (NOT the bare hostname — two agents on
+    // one machine must not share one identity); the key file derives from
+    // it and is auto-generated on first use.
     let s = resolveDapSettings();
     assert.equal(s.url, 'ws://127.0.0.1:8787/ws');
-    assert.equal(s.keyPath, path.join(home, '.dap', 'keys', `${os.hostname()}.key`));
+    assert.ok(s.name, 'unnamed default resolves to a generated name');
+    assert.notEqual(s.name, os.hostname(), 'never the bare hostname');
+    assert.equal(s.keyPath, path.join(home, '.dap', 'keys', `${s.name}.key`));
     assert.equal(s.channelsFile, path.join(home, '.dap', 'channels.json'));
-    assert.equal(s.name, undefined);
     assert.equal(s.clientSecret, undefined);
     assert.equal(s.clientSecretSource, undefined, 'no secret anywhere: master-only/tokenless dial');
 

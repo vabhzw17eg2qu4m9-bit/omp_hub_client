@@ -83,7 +83,7 @@ Zero-config by default; resolution order is explicit override > environment >
 | Env var             | Purpose                       |
 |---------------------|-------------------------------|
 | `DAP_HUB_URL`       | Hub WebSocket URL (default `ws://127.0.0.1:8787/ws`) |
-| `DAP_AGENT_NAME`    | Display name / identity (default: hostname) |
+| `DAP_AGENT_NAME`    | Display name / identity. Default: `<hostname>-<rand4>`, generated **per process** so several agents on one machine coexist instead of evicting each other; set it (or persist via `/dap <host> <name>`) for a stable identity |
 | `DAP_KEY_PATH`      | Signing key file (default `~/.dap/keys/<name>.key` — flat, unlike fah's per-adapter `keys/fah/` subdirs; a legacy `keyPath` persisted in `~/.dap/config.json` still wins) |
 | `DAP_CHANNELS_FILE` | Channel store location (default `~/.dap/channels.json`) |
 | `DAP_CONFIG_FILE`   | Config file location (default `~/.dap/config.json`) |
