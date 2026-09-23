@@ -32,4 +32,8 @@
 
 - fix: extension failed to load and deliver on upstream pi
 
+## 0.1.8
+
+- fix: random per-process default agent name — two agents can share a host
+
 ## Unreleased
