@@ -84,6 +84,7 @@ function disabledExtension(ctx: ExtensionAPI): DapExtension {
   ]) {
     ctx.registerTool({
       name,
+      label: name.replace(/^dap_/, 'DAP '),
       description: `DAP tool: ${DISABLED_ERROR}`,
       parameters: { type: 'object', properties: {} },
       execute: async () => fail(),
@@ -186,7 +187,33 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   const created = existing === undefined; // this call constructed the client
   // client.agentId is read LIVE everywhere below — a captured value went
   // stale after a /dap re-key (status kept the pre-retarget id).
-  ctx.setLabel('DAP — distributed agents');
+  //
+  // Host probe + omp label in one call. The two hosts diverge on load-time
+  // action methods: upstream pi (0.8x) stubs setLabel/sendMessage/appendEntry
+  // with a throw during extension loading ("Extension runtime not initialized"),
+  // and its setLabel is entry-scoped (setLabel(entryId, label)) — while omp
+  // treats setLabel as a load-safe extension label. omp gets its label; the
+  // throw marks upstream pi and routes sendMessage through its object form.
+  let piHost = false;
+  try {
+    ctx.setLabel('DAP — distributed agents');
+  } catch {
+    piHost = true;
+  }
+  /** Host-normalized agent notification. omp's sendMessage takes a plain
+   *  string; pi's takes a CustomMessage object — a string there yields
+   *  customType: undefined + content: [] and the model never sees the text
+   *  (every inbound DAP message would steer an empty turn). */
+  const notifyAgent = (text: string, opts?: { deliverAs?: 'steer' | 'followUp' | 'nextTurn'; triggerTurn?: boolean }): void => {
+    if (!piHost) {
+      ctx.sendMessage(text, opts);
+      return;
+    }
+    (ctx.sendMessage as unknown as (message: unknown, options?: unknown) => void)(
+      { customType: 'dap.message', content: text, display: text },
+      opts,
+    );
+  };
   // Persistent connection line in the omp footer (visible without asking):
   // DAP <name|id> · <host> · <state> · #chan1,#chan2. ui reference is
   // captured at session_start; setStatus is a no-op in headless modes and
@@ -203,19 +230,21 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   let started = false; // one dial per process: the FIRST session connects
   ctx.on('session_start', (_event, sctx) => {
     ui = sctx.ui;
-    pollerCtx = sctx; // managed timers for the pending-invite poller
-    startPoller();
-    if (sctx.hasUI && sctx.ui) {
-      sctx.ui.notify(`DAP connected as ${client.agentId}${settings.name ? ` (${settings.name})` : ''}`, 'info');
-    }
-    renderStatus(client.connected ? 'connected' : 'connecting…');
+    pollerCtx = sctx; // managed timers for the pending-invite poller (omp)
     // Owner rule: install/validation opens NO connection — the dial happens
     // when the harness session itself starts. A reused client is already
-    // connected.
+    // connected. FIRST in the handler: a throw in anything below (e.g. a
+    // host without managed timers) must never block the dial — upstream pi
+    // aborts the whole session_start handler on a handler error.
     if (!started && created) {
       started = true;
       client.connect();
     }
+    if (sctx.hasUI && sctx.ui) {
+      sctx.ui.notify(`DAP connected as ${client.agentId}${settings.name ? ` (${settings.name})` : ''}`, 'info');
+    }
+    renderStatus(client.connected ? 'connected' : 'connecting…');
+    startPoller();
   });
   const inbox = new Inbox(100, (entry) => ctx.appendEntry('io.dap.message', entry));
   // Explicit channel maps (tests) opt out of the channels-file lifecycle;
@@ -267,7 +296,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     cryptoCtx.channelPrivs[invite.channel] = invite.priv;
     if (useChannelFile) persistChannelKeys(settings.channelsFile, invite.channel, invite);
     client.join(invite.channel, invite.pub);
-    ctx.sendMessage(`[dap] invited to #${invite.channel} by ${from}`, { deliverAs: 'steer', triggerTurn: true });
+    notifyAgent(`[dap] invited to #${invite.channel} by ${from}`, { deliverAs: 'steer', triggerTurn: true });
   };
 
   // Subscribe (not assign): every session of a shared client receives each
@@ -290,7 +319,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
         });
         // Steer + triggerTurn: steers the live turn AND starts one when the
         // agent is idle — without triggerTurn an idle agent shows nothing.
-        ctx.sendMessage(formatEntry(entry, frame.from), { deliverAs: 'steer', triggerTurn: true });
+        notifyAgent(formatEntry(entry, frame.from), { deliverAs: 'steer', triggerTurn: true });
       })
       .catch((err: unknown) =>
         ctx.appendEntry('io.dap.undecryptable', { type: 'dap_undecryptable', id: frame.id, error: String(err) }),
@@ -314,7 +343,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
     const code = typeof f === 'object' && f !== null && 'code' in f ? String(f.code) : 'error';
     const msg = typeof f === 'object' && f !== null && 'msg' in f ? String(f.msg) : JSON.stringify(f);
     ctx.appendEntry('io.dap.error', { code, msg });
-    ctx.sendMessage(`[dap] hub rejected a frame — ${code}: ${msg}`, {
+    notifyAgent(`[dap] hub rejected a frame — ${code}: ${msg}`, {
       deliverAs: 'steer',
       triggerTurn: true,
     });
@@ -352,7 +381,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   const surface = (msg: string): void => {
     renderStatus(msg);
     ctx.appendEntry('io.dap.error', { code: 'invite_failed', msg });
-    ctx.sendMessage(`[dap] ${msg}`, { deliverAs: 'steer', triggerTurn: true });
+    notifyAgent(`[dap] ${msg}`, { deliverAs: 'steer', triggerTurn: true });
   };
   // Enrollment auth: a 401 dial failure is never silent; a successful
   // enrollment is logged without ever printing the secret itself.
@@ -391,18 +420,30 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   const pollPending = (): void => {
     void deliverPending().catch((err: unknown) => surface(`pending invite check failed: ${String(err)}`));
   };
-  /** Managed ctx.setInterval poller (~15s): starts once the session context
-   *  (timers) and the first welcome both exist; dispose clears it. */
+  /** Pending-invite poller (~15s): omp exposes managed, error-isolated
+   *  timers on the session context (setInterval/clearTimer); upstream pi's
+   *  ExtensionContext has NO timers at all — fall back to a raw interval,
+   *  unref'd so a headless print-mode process can still exit. pollPending
+   *  itself never throws (async body + .catch). Starts once the session
+   *  context and the first welcome both exist; dispose clears it. */
   const INVITE_POLL_MS = 15000;
   let pollerCtx: SessionCtx | undefined;
-  let pollerHandle: unknown;
+  let pollerHandle: unknown; // omp managed timer
+  let rawPoller: ReturnType<typeof setInterval> | undefined; // pi fallback
   const startPoller = (): void => {
-    if (pollerHandle !== undefined || !pollerCtx) return;
-    pollerHandle = pollerCtx.setInterval(pollPending, INVITE_POLL_MS);
+    if (pollerHandle !== undefined || rawPoller !== undefined) return;
+    if (pollerCtx && typeof pollerCtx.setInterval === 'function') {
+      pollerHandle = pollerCtx.setInterval(pollPending, INVITE_POLL_MS);
+      return;
+    }
+    const t = setInterval(pollPending, INVITE_POLL_MS);
+    (t as NodeJS.Timeout).unref?.(); // never own the process lifetime
+    rawPoller = t;
   };
 
   ctx.registerTool({
     name: 'dap_send',
+    label: 'DAP send',
     description: 'Send an end-to-end-encrypted message to a DAP channel.',
     parameters: {
       type: 'object',
@@ -428,6 +469,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   ctx.registerTool({
     name: 'dap_dm',
+    label: 'DAP DM',
     description: 'Send an end-to-end-encrypted direct message to another agent (by agentId).',
     parameters: {
       type: 'object',
@@ -450,6 +492,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   ctx.registerTool({
     name: 'dap_invite',
+    label: 'DAP invite',
     description: 'Invite another agent to a channel: DMs them the channel keypair (normal E2E DM encryption; the text payload happens to be JSON).',
     parameters: {
       type: 'object',
@@ -464,6 +507,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   ctx.registerTool({
     name: 'dap_inbox',
+    label: 'DAP inbox',
     description: 'List recent DAP messages delivered to this agent (durable inbox).',
     parameters: {
       type: 'object',
@@ -484,6 +528,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   ctx.registerTool({
     name: 'dap_whois',
+    label: 'DAP whois',
     description: 'Look up another agent (pubkey, display name, online) by agentId. Ids are 16-hex — discover them via dap_peers, never names.',
     parameters: {
       type: 'object',
@@ -508,6 +553,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   });
   ctx.registerTool({
     name: 'dap_status',
+    label: 'DAP status',
     description: 'Own DAP connection status: are we connected to the hub, our agentId, name, hub url, known channels.',
     parameters: { type: 'object', properties: {} },
     execute: async () => toolResult(statusPayload()),
@@ -523,6 +569,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
 
   ctx.registerTool({
     name: 'dap_peers',
+    label: 'DAP peers',
     description: 'Online agents on the hub: online peers only; your own entry is present and marked self (self: true). Discover agentIds here — they are 16-hex ids, never names.',
     parameters: { type: 'object', properties: {} },
     execute: async () => {
@@ -568,6 +615,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   };
   ctx.registerTool({
     name: 'dap_connect',
+    label: 'DAP connect',
     description: "Connect to any DAP hub at runtime (a manual invitation): host (hub.example.com, hub:8787, or ws(s)://…), optional name (display name AND identity — same name = same agent everywhere), optional channel (default room, joined after connect and on every later launch; persisted to ~/.dap/config.json). NOTE: if the room already exists on that hub under another member's key, ask a member to dap_invite you — otherwise you can post but members cannot read you.",
     parameters: {
       type: 'object',
@@ -682,8 +730,12 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   });
   const dispose = (): void => {
     offMessage(); // dead sessions must not keep receiving (or steering) frames
-    if (pollerHandle !== undefined) pollerCtx?.clearTimer(pollerHandle);
+    if (pollerHandle !== undefined) pollerCtx?.clearTimer?.(pollerHandle);
     pollerHandle = undefined;
+    if (rawPoller !== undefined) {
+      clearInterval(rawPoller);
+      rawPoller = undefined;
+    }
     if (shared === undefined) {
       client.stop();
       return;

@@ -91,7 +91,7 @@ function fakeCtx(): Captured {
   let sessionStarted = false;
   const ctx: ExtensionAPI = {
     registerTool: (tool) => void tools.set(tool.name, tool),
-    sendMessage: (msg, opts) => void sent.push({ msg, opts }),
+    sendMessage: (msg, opts) => void sent.push({ msg: msg as string, opts }), // fake models the omp surface: index.ts only sends the object form to a pi host
     appendEntry: (type, data) => void entries.push({ type, data }),
     setLabel: (label) => void labels.push(label),
     on: (event, handler) => {
@@ -244,6 +244,78 @@ test('DM decrypt round-trip between two client instances (both directions)', asy
     assert.match(a.sent[0].msg, /pong/);
   } finally {
     extA.dispose();
+    extB.dispose();
+    await hub.close();
+  }
+});
+
+test('upstream pi host: setLabel throws at load, no managed timers, sendMessage takes the object form', async () => {
+  const hub = await new FakeHub().listen();
+  const chan = newChannelKeypair();
+  /** Fake ExtensionAPI matching upstream pi (0.8x): action methods throw
+   *  during loading, the session context has NO timer methods, and
+   *  sendMessage expects a CustomMessage OBJECT (a plain string there
+   *  steers an empty turn — the model never sees the text). */
+  const piCtx = (): Captured => {
+    const tools = new Map<string, ToolDefinition>();
+    const sent: Captured['sent'] = [];
+    const entries: Captured['entries'] = [];
+    const handlers = new Map<string, (event: unknown, ctx: SessionCtx) => void | Promise<void>>();
+    const commands = new Map<string, CapturedCommand>();
+    let sessionStarted = false;
+    const ctx: ExtensionAPI = {
+      registerTool: (tool) => void tools.set(tool.name, tool),
+      sendMessage: (msg, opts) => void sent.push({ msg: msg as string, opts }),
+      appendEntry: (type, data) => void entries.push({ type, data }),
+      setLabel: () => {
+        throw new Error('Extension runtime not initialized. Action methods cannot be called during extension loading.');
+      },
+      on: (event, handler) => {
+        void handlers.set(event, handler);
+        if (event === 'session_start') {
+          queueMicrotask(() => {
+            if (sessionStarted) return;
+            sessionStarted = true;
+            // pi's ExtensionContext: ui present (no-op), NO managed timers.
+            void handler({ type: 'session_start', reason: 'startup' }, {
+              hasUI: false,
+              isIdle: () => true,
+              ui: { notify: () => {}, setStatus: () => {} },
+            } satisfies SessionCtx);
+          });
+        }
+      },
+      registerCommand: (name, def) => void commands.set(name, def as CapturedCommand),
+    };
+    return { ctx, tools, commands, sent, entries, labels: [], fire: (event, sctx) => void handlers.get(event)?.(sctx, sctx) };
+  };
+  const a = piCtx();
+  const b = fakeCtx();
+  const extA = dapExtension(a.ctx, { url: hub.url, keyPath: nextKeyPath(), channelPrivs: { general: chan.priv } });
+  const extB = dapExtension(b.ctx, { url: hub.url, keyPath: nextKeyPath(), channels: { general: chan.pub } });
+  try {
+    // The dial lives in session_start BEFORE the timer-dependent poller: a
+    // pi session context without managed timers must still connect.
+    await nextEvent(extA.client, 'welcome');
+    await nextEvent(extB.client, 'welcome');
+    assert.equal(extA.client.connected, true, 'pi host connects without managed timers');
+
+    // Inbound delivery on the pi host: object form, not a bare string.
+    const inboundA = nextEvent<MsgFrame>(extA.client, 'inbound');
+    await run(b, 'dap_send', { channel: 'general', text: 'ground control to major tom' });
+    await inboundA;
+    assert.equal(a.sent.length, 1, 'inbound msg steered into the pi turn');
+    const piMsg = a.sent[0].msg as unknown as Record<string, unknown>;
+    assert.equal(piMsg.customType, 'dap.message');
+    assert.match(String(piMsg.content), /#general/);
+    assert.match(String(piMsg.content), /ground control to major tom/);
+    assert.match(String(piMsg.display), /ground control/);
+    assert.equal(a.sent[0].opts?.deliverAs, 'steer');
+    assert.equal(a.sent[0].opts?.triggerTurn, true);
+    // Durable entry (namespaced customType) — pi appendEntry(customType, data).
+    assert.equal(a.entries.at(-1)!.type, 'io.dap.message');
+  } finally {
+    extA.dispose(); // clears the raw (fallback) poller interval
     extB.dispose();
     await hub.close();
   }
