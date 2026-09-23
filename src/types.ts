@@ -12,9 +12,11 @@ export interface SessionCtx {
   };
   hasUI: boolean;
   isIdle(): boolean;
-  /** Managed, error-isolated timers (unlike raw timers). */
-  setInterval(fn: () => void, ms: number): unknown;
-  clearTimer(handle: unknown): void;
+  /** Managed, error-isolated timers (omp only). Upstream pi's
+   *  ExtensionContext has NO timer methods — callers must feature-detect
+   * (typeof sctx.setInterval === 'function') and fall back to raw timers. */
+  setInterval?(fn: () => void, ms: number): unknown;
+  clearTimer?(handle: unknown): void;
 }
 
 /** Context omp passes to slash-command handlers (ui present in interactive mode). */
@@ -36,6 +38,8 @@ export interface AgentToolResult {
 
 export interface ToolDefinition {
   name: string;
+  /** Human-readable label for the UI (required by upstream pi's
+   *  ToolDefinition; optional in omp). */
   label?: string;
   description: string;
   /** Plain JSON Schema ({type:'object', properties, required}). */
@@ -50,13 +54,19 @@ export interface ToolDefinition {
 }
 
 export interface ExtensionAPI {
-  sendMessage(message: string, opts?: SendMessageOptions): void;
+  /** omp: accepts a plain string. Upstream pi: requires a CustomMessage
+   *  object ({ customType, content, display, details }) — a string yields
+   *  an empty custom message the model never sees. Dual-host callers must
+   *  normalize (see notifyAgent in index.ts). */
+  sendMessage(message: string | Record<string, unknown>, opts?: SendMessageOptions): void;
   /** Durable state: append-only entries the harness persists
    *  (customType is a namespaced string, e.g. 'io.dap.message'). */
   appendEntry(customType: string, data: unknown): void;
   on(event: string, handler: (event: unknown, ctx: SessionCtx) => void | Promise<void>): void;
   registerTool(def: ToolDefinition): void;
-  /** Extension label shown in the UI. */
+  /** omp: load-safe extension label — setLabel(label).
+   * Upstream pi: entry-scoped setLabel(entryId, label) that THROWS when
+   * called during extension loading (action-method stub). */
   setLabel(label: string): void;
   /** Optional: harness slash-command registration (omp). */
   registerCommand?(name: string, def: { description: string; handler: (args: string, cmdCtx?: CommandCtx) => string }): void;
