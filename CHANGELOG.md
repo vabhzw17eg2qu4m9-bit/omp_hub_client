@@ -37,3 +37,5 @@
 - fix: random per-process default agent name — two agents can share a host
 
 ## Unreleased
+
+- fix: per-identity client secrets — the hub binds an issued secret to the enrolled name, but it was cached in one shared `~/.dap/config.json` field, so a second agent on the same host (or `/dap <host> <new name>`) dialed with another identity's secret and the hub rejected the hello (`access_denied: hello name does not match the enrolled secret`) in a reconnect loop. Secrets now persist per identity (`clientSecrets`, keyed by the key file; legacy top-level `clientSecret` still honored), retarget re-resolves the secret for the new identity, and a post-upgrade `access_denied` on a config-cached secret self-heals via one master re-enroll (the 401 path's in-band twin)

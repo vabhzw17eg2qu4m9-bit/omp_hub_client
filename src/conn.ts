@@ -79,6 +79,12 @@ export interface DapOptions {
    *  user intent, never wiped; unset (no secret, or caller-resolved
    *  elsewhere) never escalates. */
   clientSecretSource?: ClientSecretSource;
+  /** Identity handle for secret persistence: the resolved keyPath (one key
+   *  file = one identity = one name). The hub binds an issued secret to the
+   *  hello name it enrolled under, so enroll/wipe persist into THAT
+   *  identity's own clientSecrets slot — a second identity on the same
+   *  host never dials with (or overwrites) this one's secret. */
+  identityKey?: string;
 }
 
 type Listener = (value: unknown) => void;
@@ -208,8 +214,21 @@ export class DapClient {
 
   /** Runtime retarget (dap_connect): stop everything, swap url and/or
    *  identity keys and display name, then connect fresh. A new name means
-   *  a new identity (name-derived key file) — a different agentId. */
-  retarget(next: { url?: string; keys?: KeyPair; name?: string }): void {
+   *  a new identity (name-derived key file) — a different agentId — so the
+   *  caller re-resolves and swaps the client secret (and identityKey) for
+   *  the NEW identity: the hub rejects a hello whose name does not match
+   *  the enrolled secret, and the previous identity's secret is bound to
+   *  the previous name. */
+  retarget(next: {
+    url?: string;
+    keys?: KeyPair;
+    name?: string;
+    /** Re-resolved secret for the (possibly new) identity; applied when the
+     *  field is present (undefined = enroll-mode dial via master secret). */
+    clientSecret?: string;
+    clientSecretSource?: ClientSecretSource;
+    identityKey?: string;
+  }): void {
     if (this.timer !== undefined) this.timers.clearInterval(this.timer);
     this.timer = undefined;
     this.watchdog.stop();
@@ -228,6 +247,11 @@ export class DapClient {
       this.whoisCache.clear();
     }
     if (next.name !== undefined) this.opts.name = next.name;
+    if ('clientSecret' in next) {
+      this.opts.clientSecret = next.clientSecret;
+      this.opts.clientSecretSource = next.clientSecretSource;
+    }
+    if (next.identityKey !== undefined) this.opts.identityKey = next.identityKey;
     this.delay = this.backoff.initial;
     this.connect();
   }
@@ -431,6 +455,16 @@ export class DapClient {
         this.emit('presence', frame);
         break;
       case 'error':
+        // Post-upgrade rejection (hub 401s pre-upgrade; this is the
+        // in-band twin): an access_denied on a dial whose bearer was a
+        // config-cached client secret means that secret is not valid for
+        // THIS identity — the live incident: the shared legacy field made
+        // a second identity on one host hello with a secret enrolled under
+        // another name ("hello name does not match the enrolled secret").
+        // Same recovery as the 401 path: drop the stale cache, force the
+        // dial cycle, re-enroll once. The error is still emitted below —
+        // one surfaced rejection per streak, never silence.
+        if (frame.code === 'access_denied' && this.escalateStaleSecret()) this.ws?.close();
         for (const waiters of this.whoisWaiters.values()) for (const resolve of waiters) resolve(undefined);
         this.whoisWaiters.clear();
         this.emit('error', frame);
@@ -458,13 +492,16 @@ export class DapClient {
   /** {"t":"enrolled","secret"}: bind the issued secret to this identity,
    *  persist it (config file; the master secret is never stored or logged)
    *  and use it for every later dial — this process (opts mutation) and
-   *  future launches (config.json). */
+   *  future launches (config.json). Persisted into THIS identity's
+   *  clientSecrets slot when identityKey is set: a shared field made every
+   *  other identity on the host dial with (and get rejected by) a secret
+   *  bound to this identity's name. */
   private onEnrolled(frame: Record<string, unknown>): void {
     const secret = typeof frame.secret === 'string' ? frame.secret : '';
     if (!this.enrollPending || !secret) return;
     this.enrollPending = false;
     this.opts.clientSecret = secret;
-    persistDapConfig({ clientSecret: secret });
+    persistDapConfig({ clientSecret: secret, identityKey: this.opts.identityKey });
     this.emit('enrolled', frame);
   }
 
@@ -472,17 +509,21 @@ export class DapClient {
    *  secrets, so every previously enrolled client 401-loops on its config
    *  clientSecret). A 401 on a CONFIG-sourced bearer is recoverable when
    *  DAP_MASTER_SECRET is available: drop the stale secret from this
-   *  process AND config.json; the scheduled reconnect dials ONCE in
-   *  enroll-mode (master bearer -> hello -> enroll -> onEnrolled re-persists
-   *  the issued secret). Env-sourced and master dials never escalate: env
-   *  is explicit user intent, and a 401 on the enroll-mode dial itself is
-   *  fatal — exactly one retry, no loops. Identity keys are never touched:
-   *  re-enrollment binds to the same hello identity. */
+   *  process AND config.json (the identity's own slot plus the legacy
+   *  shared field); the scheduled reconnect dials ONCE in enroll-mode
+   *  (master bearer -> hello -> enroll -> onEnrolled re-persists the
+   *  issued secret). Env-sourced and master dials never escalate: env is
+   *  explicit user intent, and a rejection on the enroll-mode dial itself
+   *  is fatal — exactly one retry, no loops. Identity keys are never
+   *  touched: re-enrollment binds to the same hello identity. The
+   *  guard on an already-cleared secret keeps repeated rejections on one
+   *  dial (401 + in-band access_denied twins) one single escalation. */
   private escalateStaleSecret(): boolean {
     if (this.dialToken !== 'client' || this.opts.clientSecretSource !== 'config') return false;
+    if (this.opts.clientSecret === undefined) return false;
     if (!optStr(process.env.DAP_MASTER_SECRET)) return false;
     this.opts.clientSecret = undefined;
-    persistDapConfig({ clientSecret: null }); // drop the stale cache entry
+    persistDapConfig({ clientSecret: null, identityKey: this.opts.identityKey }); // drop the stale cache entry
     return true;
   }
 
