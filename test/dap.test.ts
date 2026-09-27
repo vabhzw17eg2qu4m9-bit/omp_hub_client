@@ -29,9 +29,10 @@ process.env.HOME = KEYDIR;
 const DAP_ENV_KEYS = ['DAP_HUB_URL', 'DAP_KEY_PATH', 'DAP_AGENT_NAME', 'DAP_CHANNELS_FILE', 'DAP_CLIENT_SECRET', 'DAP_MASTER_SECRET'];
 const savedEnv = Object.fromEntries(DAP_ENV_KEYS.map((k) => [k, process.env[k]]));
 for (const k of DAP_ENV_KEYS) delete process.env[k];
-// Suite default: the DAP_MASTER_SECRET gate keeps the extension inert
-// without the secret, so every connect-path test runs with one set. Tests
-// of the gate itself save/delete/restore it locally.
+// Suite default: the boot gate keeps the extension inert without ANY
+// resolvable credential (DAP_MASTER_SECRET or a client secret via env /
+// config), so every connect-path test runs with one set. Tests of the gate
+// itself save/delete/restore the credential env locally.
 process.env.DAP_MASTER_SECRET = 'test-master';
 
 test.after(() => {
@@ -1225,7 +1226,7 @@ test('/dap invite (no args) and bare /dap: print the paste-ready connect line (h
     const dap = command(cap, 'dap');
     const line =
       `send to other user:  /dap 127.0.0.1:${hub.port} <name>\n` + // ws://…/ws stripped to host:port
-      'first connect needs DAP_MASTER_SECRET set (enrolls once, then stored)';
+      'connect with DAP_MASTER_SECRET (enroll) or DAP_CLIENT_SECRET / config clientSecret (connect)';
     assert.equal(dap.handler('invite'), line);
     // omp discards handler return values — the share line must arrive via cmdCtx.ui.notify.
     const notified: string[] = [];
@@ -2286,6 +2287,184 @@ test('gate: DAP_MASTER_SECRET set -> connect and footer behave exactly as before
   } finally {
     if (prev === undefined) delete process.env.DAP_MASTER_SECRET;
     else process.env.DAP_MASTER_SECRET = prev;
+    await hub.close();
+  }
+});
+
+test('gate: DAP_CLIENT_SECRET alone boots the extension — connect, no enroll (the kill-switch defect)', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const status: string[] = [];
+  const prevMaster = process.env.DAP_MASTER_SECRET;
+  const prevClient = process.env.DAP_CLIENT_SECRET;
+  delete process.env.DAP_MASTER_SECRET;
+  process.env.DAP_CLIENT_SECRET = 'env-secret';
+  try {
+    const ext = dapExtension(cap.ctx, {
+      url: hub.url,
+      keyPath: nextKeyPath(),
+      name: 'client-boot',
+      channelsFile: path.join(KEYDIR, 'ch-gate3-' + ++keySeq + '.json'),
+    });
+    assert.ok(ext.client, 'client constructed on a resolvable client secret alone');
+    cap.fire('session_start', {
+      hasUI: true,
+      isIdle: () => false,
+      ui: { notify: () => {}, setStatus: (_k: string, text: string | undefined) => void status.push(text ?? 'CLEARED') },
+      setInterval: () => 0,
+      clearTimer: () => {},
+    });
+    assert.match(status.at(-1)!, /connecting/, 'footer live from the start');
+    await nextEvent(ext.client, 'welcome');
+    assert.match(status.at(-1)!, /connected/);
+    assert.deepEqual(hub.upgrades, ['env-secret'], 'dialed with the client bearer, no master in play');
+    assert.deepEqual(hub.enrollRequests, [], 'no enroll attempt: the master secret is absent');
+    const st = await run<{ connected: boolean; error?: string }>(cap, 'dap_status');
+    assert.equal(st.connected, true, 'dap_status answers live state, not the disabled error');
+    assert.equal(st.error, undefined);
+    ext.dispose();
+  } finally {
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
+    if (prevClient === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = prevClient;
+    await hub.close();
+  }
+});
+
+test('gate: config clientSecret boots — per-identity slot and legacy field, source config', async () => {
+  const hub = await new FakeHub().listen();
+  const cfgFile = path.join(KEYDIR, 'cfg-gateboot-' + ++keySeq + '.json');
+  const prevCfg = process.env.DAP_CONFIG_FILE;
+  const prevMaster = process.env.DAP_MASTER_SECRET;
+  const prevClient = process.env.DAP_CLIENT_SECRET;
+  process.env.DAP_CONFIG_FILE = cfgFile;
+  delete process.env.DAP_MASTER_SECRET;
+  delete process.env.DAP_CLIENT_SECRET;
+  const keyA = nextKeyPath();
+  const keyB = nextKeyPath();
+  const fire = (cap: Captured): void =>
+    cap.fire('session_start', {
+      hasUI: false,
+      isIdle: () => true,
+      ui: undefined,
+      setInterval: () => 0,
+      clearTimer: () => {},
+    });
+  try {
+    // AC2: the identity's own clientSecrets slot.
+    fs.writeFileSync(cfgFile, JSON.stringify({ clientSecrets: { [keyA]: 'slot-secret' } }));
+    const viaSlot = resolveDapSettings({ url: hub.url, keyPath: keyA, name: 'slot-boot' });
+    assert.equal(viaSlot.clientSecret, 'slot-secret');
+    assert.equal(viaSlot.clientSecretSource, 'config');
+    const capA = fakeCtx();
+    const extA = dapExtension(capA.ctx, {
+      url: hub.url,
+      keyPath: keyA,
+      name: 'slot-boot',
+      channelsFile: path.join(KEYDIR, 'ch-gate4-' + ++keySeq + '.json'),
+    });
+    assert.ok(extA.client, 'boots on the persisted slot alone');
+    fire(capA);
+    await nextEvent(extA.client, 'welcome');
+
+    // AC3: a legacy top-level clientSecret only.
+    fs.writeFileSync(cfgFile, JSON.stringify({ clientSecret: 'legacy-secret' }));
+    const viaLegacy = resolveDapSettings({ url: hub.url, keyPath: keyB, name: 'legacy-boot' });
+    assert.equal(viaLegacy.clientSecretSource, 'config');
+    const capB = fakeCtx();
+    const extB = dapExtension(capB.ctx, {
+      url: hub.url,
+      keyPath: keyB,
+      name: 'legacy-boot',
+      channelsFile: path.join(KEYDIR, 'ch-gate5-' + ++keySeq + '.json'),
+    });
+    assert.ok(extB.client, 'boots on the legacy shared field alone');
+    fire(capB);
+    await nextEvent(extB.client, 'welcome');
+
+    assert.deepEqual(hub.upgrades, ['slot-secret', 'legacy-secret'], 'each boot dialed its own config bearer');
+    const st = await run<{ connected: boolean }>(capB, 'dap_status');
+    assert.equal(st.connected, true);
+    extA.dispose();
+    extB.dispose();
+  } finally {
+    if (prevCfg === undefined) delete process.env.DAP_CONFIG_FILE;
+    else process.env.DAP_CONFIG_FILE = prevCfg;
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
+    if (prevClient === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = prevClient;
+    await hub.close();
+  }
+});
+
+test('gate: nothing resolvable stays inert — empty DAP_CLIENT_SECRET counts as unset; error names the full chain', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const prevMaster = process.env.DAP_MASTER_SECRET;
+  const prevClient = process.env.DAP_CLIENT_SECRET;
+  delete process.env.DAP_MASTER_SECRET;
+  process.env.DAP_CLIENT_SECRET = ''; // optStr: empty = unset — must NOT boot
+  try {
+    const ext = dapExtension(cap.ctx, {
+      url: hub.url,
+      keyPath: nextKeyPath(),
+      channelsFile: path.join(KEYDIR, 'ch-gate6-' + ++keySeq + '.json'),
+    });
+    cap.fire('session_start', {
+      hasUI: true,
+      isIdle: () => false,
+      ui: { notify: () => {}, setStatus: () => {} },
+      setInterval: () => 0,
+      clearTimer: () => {},
+    });
+    await microtasksSettled();
+    assert.equal(ext.client, undefined, 'an empty client secret does not boot the extension');
+    assert.equal(hub.upgrades.length, 0, 'zero dials');
+    // AC6: the honest error names the FULL credential chain, no master-only wording.
+    assert.match(DISABLED_ERROR, /DAP_MASTER_SECRET/, 'names the enroll path');
+    assert.match(DISABLED_ERROR, /DAP_CLIENT_SECRET/, 'names the connect path');
+    assert.ok(!DISABLED_ERROR.includes('is not set — DAP disabled'), 'master-only wording gone');
+  } finally {
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
+    if (prevClient === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = prevClient;
+    await hub.close();
+  }
+});
+
+test('gate: DAP_CLIENT_SECRET and DAP_MASTER_SECRET both set — client bearer dials, master stays enroll-only', async () => {
+  const hub = await new FakeHub().listen();
+  const cap = fakeCtx();
+  const prevMaster = process.env.DAP_MASTER_SECRET;
+  const prevClient = process.env.DAP_CLIENT_SECRET;
+  process.env.DAP_MASTER_SECRET = 'still-master';
+  process.env.DAP_CLIENT_SECRET = 'explicit-secret';
+  try {
+    const ext = dapExtension(cap.ctx, {
+      url: hub.url,
+      keyPath: nextKeyPath(),
+      name: 'both-set',
+      channelsFile: path.join(KEYDIR, 'ch-gate7-' + ++keySeq + '.json'),
+    });
+    assert.ok(ext.client);
+    cap.fire('session_start', {
+      hasUI: false,
+      isIdle: () => true,
+      ui: undefined,
+      setInterval: () => 0,
+      clearTimer: () => {},
+    });
+    await nextEvent(ext.client, 'welcome');
+    assert.deepEqual(hub.upgrades, ['explicit-secret'], 'explicit client secret connects — no flap to the master bearer');
+    ext.dispose();
+  } finally {
+    if (prevMaster === undefined) delete process.env.DAP_MASTER_SECRET;
+    else process.env.DAP_MASTER_SECRET = prevMaster;
+    if (prevClient === undefined) delete process.env.DAP_CLIENT_SECRET;
+    else process.env.DAP_CLIENT_SECRET = prevClient;
     await hub.close();
   }
 });

@@ -63,10 +63,12 @@ const hostOf = (url: string): string => url.replace(/^wss?:\/\//, '').replace(/\
  *  surfaced via surface() so the verdict reaches the user even headless. */
 const DENIED_HINT =
   'hub rejected connection (HTTP 401): set DAP_MASTER_SECRET to enroll, or DAP_CLIENT_SECRET / config clientSecret to connect';
-/** Owner gate: without DAP_MASTER_SECRET (unset or empty) the whole
+/** Owner gate: without ANY resolvable credential (DAP_MASTER_SECRET to
+ *  enroll, or a client secret via env / config to connect) the whole
  *  extension stays inert — no socket, no reconnect, no poller, no footer.
  *  The one honest error every gated tool/command answers with. */
-export const DISABLED_ERROR = 'DAP_MASTER_SECRET is not set — DAP disabled';
+export const DISABLED_ERROR =
+  'no DAP credential — set DAP_MASTER_SECRET (enroll) or DAP_CLIENT_SECRET / config clientSecret (connect); DAP disabled';
 
 /** Gate-closed twin of dapExtension: registers the same tool and command
  *  names so every invocation gets the honest error, but constructs no
@@ -160,10 +162,14 @@ const sharedClients = new Map<string, SharedClient>();
  */
 export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOptions = {}): DapExtension {
   // Owner gate: the FIRST statement, before any side effect (key file,
-  // socket, timers, footer) — without DAP_MASTER_SECRET the extension does
-  // nothing and shows nothing.
-  if (optStr(process.env.DAP_MASTER_SECRET) === undefined) return disabledExtension(ctx);
+  // socket, timers, footer) — resolveDapSettings is pure (env + config
+  // reads only), and without ANY resolvable credential (master secret for
+  // enroll-mode, or a client secret via env / config — the same chain the
+  // dial itself consumes) the extension does nothing and shows nothing.
   const settings = resolveDapSettings(overrides);
+  if (!settings.clientSecret && optStr(process.env.DAP_MASTER_SECRET) === undefined) {
+    return disabledExtension(ctx);
+  }
   let keys: KeyPair = loadOrCreateKeys(settings.keyPath);
 
   // Production omp path (no overrides): share/refcount one client per
@@ -652,7 +658,7 @@ export default function dapExtension(ctx: ExtensionAPI, overrides: ExtensionOpti
   });
   /** The paste-ready connect line for a brand-new user (sent out-of-band). */
   const shareLine = (): string =>
-    `send to other user:  /dap ${hostOf(settings.url)} <name>\nfirst connect needs DAP_MASTER_SECRET set (enrolls once, then stored)`;
+    `send to other user:  /dap ${hostOf(settings.url)} <name>\nconnect with DAP_MASTER_SECRET (enroll) or DAP_CLIENT_SECRET / config clientSecret (connect)`;
   /** /dap invite <name|agentId> [channel]: names resolve via presence
    *  (case-insensitive; 16-hex ids pass straight through). A name that is
    *  unknown or offline arms a pending invite — the chankey DM fires

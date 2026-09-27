@@ -90,8 +90,10 @@ Zero-config by default; resolution order is explicit override > environment >
 | `DAP_MASTER_SECRET` | Hub master secret — first-connect enrollment |
 | `DAP_CLIENT_SECRET` | Hub-issued client secret (or enrolled once via master; also persisted per identity — see below) |
 
-First connect to a new hub needs `DAP_MASTER_SECRET` set (enrolls once, then
-the issued client secret is stored in `~/.dap/config.json`). The secret is
+The extension boots whenever ANY hub credential resolves — `DAP_MASTER_SECRET`
+for first-connect enrollment (enrolls once, then the issued client secret is
+stored in `~/.dap/config.json`), or a client secret (`DAP_CLIENT_SECRET` or
+the persisted per-identity entry) to connect without enrolling. The secret is
 stored **per identity** (`clientSecrets`, keyed by the identity's key file):
 the hub binds each issued secret to the enrolled agent name, so every agent
 launched on one host under a different name gets — and keeps — its own
